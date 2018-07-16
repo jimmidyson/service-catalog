@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 
-	scmeta "github.com/kubernetes-incubator/service-catalog/pkg/api/meta"
 	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog"
 	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/server"
 	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/tableconvertor"
@@ -105,30 +104,11 @@ func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
 
 // NewStorage creates a new rest.Storage responsible for accessing
 // ServiceBroker resources
-func NewStorage(opts server.Options) (serviceBrokers, serviceBrokerStatus rest.Storage) {
-	prefix := "/" + opts.ResourcePrefix()
-
-	storageInterface, dFunc := opts.GetStorage(
-		&servicecatalog.ServiceBroker{},
-		prefix,
-		serviceBrokerRESTStrategies,
-		NewList,
-		nil,
-		storage.NoTriggerPublisher,
-	)
-
+func NewStorage(optsGetter generic.RESTOptionsGetter) (serviceBrokers, serviceBrokerStatus rest.Storage, err error) {
 	store := registry.Store{
-		NewFunc:     EmptyObject,
-		NewListFunc: NewList,
-		KeyRootFunc: opts.KeyRootFunc(),
-		KeyFunc:     opts.KeyFunc(true),
-		// Retrieve the name field of the resource.
-		ObjectNameFunc: func(obj runtime.Object) (string, error) {
-			return scmeta.GetAccessor().Name(obj)
-		},
-		// Used to match objects based on labels/fields for list.
-		PredicateFunc: Match,
-		// DefaultQualifiedResource should always be plural
+		NewFunc:                  func() runtime.Object { return &servicecatalog.ServiceBroker{} },
+		NewListFunc:              func() runtime.Object { return &servicecatalog.ServiceBrokerList{} },
+		PredicateFunc:            Match,
 		DefaultQualifiedResource: servicecatalog.Resource("servicebrokers"),
 
 		CreateStrategy:          serviceBrokerRESTStrategies,
@@ -169,15 +149,15 @@ func NewStorage(opts server.Options) (serviceBrokers, serviceBrokerStatus rest.S
 		DestroyFunc: dFunc,
 	}
 
-	options := &generic.StoreOptions{RESTOptions: opts.EtcdOptions.RESTOptions, AttrFunc: GetAttrs}
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := store
 	statusStore.UpdateStrategy = serviceBrokerStatusUpdateStrategy
 
-	return &store, &StatusREST{&statusStore}
+	return &store, &StatusREST{&statusStore}, nil
 }
 
 // StatusREST defines the REST operations for the status subresource via
