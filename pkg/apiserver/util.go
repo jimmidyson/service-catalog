@@ -22,7 +22,6 @@ import (
 	settingsrest "github.com/kubernetes-incubator/service-catalog/pkg/registry/settings/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/client-go/pkg/version"
-	restclient "k8s.io/client-go/rest"
 )
 
 const (
