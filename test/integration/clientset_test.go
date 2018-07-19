@@ -500,6 +500,15 @@ func testClusterServiceClassClient(client servicecatalogclient.Interface, name s
 		return fmt.Errorf("should have two ClusterServiceClasses, had %v ClusterServiceClasses", len(serviceClasses.Items))
 	}
 
+	serviceClasses, err = serviceClassClient.List(metav1.ListOptions{FieldSelector: "metadata.name=" + name})
+	if err != nil {
+		return fmt.Errorf("error listing ClusterServiceClasses: %v", err)
+	}
+
+	if 1 != len(serviceClasses.Items) {
+		return fmt.Errorf("should have exactly one ClusterServiceClass, had %v ClusterServiceClasses", len(serviceClasses.Items))
+	}
+
 	err = serviceClassClient.Delete(name, &metav1.DeleteOptions{})
 	if nil != err {
 		return fmt.Errorf("serviceclass should be deleted (%s)", err)
@@ -707,6 +716,15 @@ func testClusterServicePlanClient(client servicecatalogclient.Interface, name st
 	}
 	if 2 != len(servicePlans.Items) {
 		return fmt.Errorf("should have two ClusterServicePlans, had %v ClusterServicePlans : %+v", len(servicePlans.Items), servicePlans.Items)
+	}
+
+	servicePlans, err = servicePlanClient.List(metav1.ListOptions{FieldSelector: "metadata.name=" + name})
+	if err != nil {
+		return fmt.Errorf("error listing ClusterServicePlans: %v", err)
+	}
+
+	if 1 != len(servicePlans.Items) {
+		return fmt.Errorf("should have exactly one ClusterServicePlan, had %v ClusterServicePlans", len(servicePlans.Items))
 	}
 
 	err = servicePlanClient.Delete(name, &metav1.DeleteOptions{})
@@ -925,6 +943,15 @@ func testInstanceClient(client servicecatalogclient.Interface, name string) erro
 	}
 
 	instances, err = instanceClient.List(metav1.ListOptions{FieldSelector: "spec.clusterServicePlanRef.name=service-plan-ref"})
+	if err != nil {
+		return fmt.Errorf("error listing instances: %v", err)
+	}
+
+	if 1 != len(instances.Items) {
+		return fmt.Errorf("should have exactly one instance, had %v instances", len(instances.Items))
+	}
+
+	instances, err = instanceClient.List(metav1.ListOptions{FieldSelector: "metadata.name=" + name})
 	if err != nil {
 		return fmt.Errorf("error listing instances: %v", err)
 	}
