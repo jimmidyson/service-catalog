@@ -910,6 +910,15 @@ func testNamespacedServiceClassClient(client servicecatalogclient.Interface, nam
 		return fmt.Errorf("should have exactly two ServiceClasses, had %v ServiceClasses", len(serviceClasses.Items))
 	}
 
+	serviceClasses, err = serviceClassClient.List(metav1.ListOptions{FieldSelector: "metadata.name=" + name})
+	if err != nil {
+		return fmt.Errorf("error listing ClusterServiceClasses: %v", err)
+	}
+
+	if 1 != len(serviceClasses.Items) {
+		return fmt.Errorf("should have exactly one ClusterServiceClass, had %v ClusterServiceClasses", len(serviceClasses.Items))
+	}
+
 	err = serviceClassClient.Delete(name, &metav1.DeleteOptions{})
 	if nil != err {
 		return fmt.Errorf("serviceclass should be deleted (%s)", err)
