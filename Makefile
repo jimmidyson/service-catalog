@@ -33,7 +33,7 @@ SRC_DIRS       = $(shell sh -c "find $(TOP_SRC_DIRS) -name \\*.go \
 TEST_DIRS     ?= $(shell sh -c "find $(TOP_SRC_DIRS) -name \\*_test.go \
                    -exec dirname {} \\; | sort | uniq")
 # Either the tag name, e.g. v1.2.3 or the commit hash for untagged commits, e.g. abc123
-VERSION       ?= $(shell git describe --always --abbrev=7 --dirty)
+VERSION       ?= $(shell git describe --tags --always --abbrev=7 --dirty)
 # Either the tag name, e.g. v1.2.3 or a combination of the closest tag combined with the commit hash, e.g. v1.2.3-2-gabc123
 TAG_VERSION   ?= $(shell git describe --tags --abbrev=7 --dirty)
 BUILD_LDFLAGS  = $(shell build/version.sh $(ROOT) $(SC_PKG))
@@ -146,42 +146,26 @@ $(BINDIR)/service-catalog: .init .generate_files cmd/service-catalog
 
 # This section contains the code generation stuff
 #################################################
-.generate_exes: $(BINDIR)/defaulter-gen \
-                $(BINDIR)/deepcopy-gen \
-                $(BINDIR)/conversion-gen \
-                $(BINDIR)/client-gen \
-                $(BINDIR)/lister-gen \
-                $(BINDIR)/informer-gen \
-                $(BINDIR)/openapi-gen
-	touch $@
+GENERATORS = $(addprefix $(BINDIR)/, defaulter-gen deepcopy-gen conversion-gen \
+	     client-gen lister-gen informer-gen openapi-gen)
 
-$(BINDIR)/defaulter-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/defaulter-gen
+.PHONY: generators
+generators: $(GENERATORS)
 
-$(BINDIR)/deepcopy-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/deepcopy-gen
+.SECONDEXPANSION:
 
-$(BINDIR)/conversion-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/conversion-gen
-
-$(BINDIR)/client-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/client-gen
-
-$(BINDIR)/lister-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/lister-gen
-
-$(BINDIR)/informer-gen: .init
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/informer-gen
-
-$(BINDIR)/openapi-gen: vendor/k8s.io/code-generator/cmd/openapi-gen
-	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/$^
+# We specify broad dependencies for these generator binaries: each one depends
+# on everything under its source tree as well as gengo's.  This uses GNU Make's
+# secondary expansion feature to pass $* to `find`.
+$(BINDIR)/%-gen: $$(shell find vendor/k8s.io/code-generator/cmd/$$*-gen vendor/k8s.io/gengo) .init
+	$(DOCKER_CMD) go build -o $@ $(SC_PKG)/vendor/k8s.io/code-generator/cmd/$*-gen
 
 .PHONY: $(BINDIR)/e2e.test
 $(BINDIR)/e2e.test: .init
 	$(DOCKER_CMD) go test -c -o $@ $(SC_PKG)/test/e2e
 
 # Regenerate all files if the gen exes changed or any "types.go" files changed
-.generate_files: .init .generate_exes $(TYPES_FILES)
+.generate_files: .init generators $(TYPES_FILES)
 	# generate apiserver deps
 	$(DOCKER_CMD) $(BUILD_DIR)/update-apiserver-gen.sh
 	# generate all pkg/client contents
@@ -197,12 +181,15 @@ $(BINDIR)/e2e.test: .init
 $(BINDIR):
 	mkdir -p $@
 
-.scBuildImage: build/build-image/Dockerfile
+.scBuildImage: build/build-image/Dockerfile $$(shell sh -c "docker inspect scbuildimage" > /dev/null 2>&1 || echo .forceIt)
 	mkdir -p .cache
 	mkdir -p .pkg
 	sed "s/GO_VERSION/$(GO_VERSION)/g" < build/build-image/Dockerfile | \
 	  docker build -t scbuildimage -f - .
 	touch $@
+
+# Just a dummy target that will force anything dependent on it to rebuild
+.forceIt:
 
 # Util targets
 ##############
@@ -222,7 +209,6 @@ verify: .init verify-generated verify-client-gen verify-docs verify-vendor
 	  'for i in $$(find $(TOP_SRC_DIRS) -name *.go \
 	    | grep -v ^pkg/kubernetes/ \
 	    | grep -v generated \
-	    | grep -v ^pkg/client/ \
 	    | grep -v v1beta1/defaults.go); \
 	  do \
 	   golint --set_exit_status $$i || exit 1; \
@@ -238,15 +224,17 @@ verify: .init verify-generated verify-client-gen verify-docs verify-vendor
 	@$(DOCKER_CMD) build/verify-errexit.sh
 	@echo Running tag verification:
 	@$(DOCKER_CMD) build/verify-tags.sh
+	@echo Validating golden file flag is defined:
+	@$(DOCKER_CMD) go test -run DRYRUN ./cmd/svcat/... -update || printf "\n\nmake test-update-goldenfiles is broken. For each failed package above, add the following empty import to one of the test files to define the -update flag:\n_ \"github.com/kubernetes-incubator/service-catalog/internal/test\""
 
 verify-docs: .init
 	@echo Running href checker$(SKIP_COMMENT):
 	@$(DOCKER_CMD) verify-links.sh -s .pkg -s .bundler -s _plugins -s _includes -t $(SKIP_HTTP) .
 
-verify-generated: .init .generate_exes
+verify-generated: .init generators
 	$(DOCKER_CMD) $(BUILD_DIR)/update-apiserver-gen.sh --verify-only
 
-verify-client-gen: .init .generate_exes
+verify-client-gen: .init generators
 	$(DOCKER_CMD) $(BUILD_DIR)/verify-client-gen.sh
 
 format: .init
@@ -303,7 +291,6 @@ clean: clean-bin clean-build-image clean-generated clean-coverage
 
 clean-bin: .init $(scBuildImageTarget)
 	$(DOCKER_CMD) rm -rf $(BINDIR)
-	rm -f .generate_exes
 
 clean-build-image: .init $(scBuildImageTarget)
 	$(DOCKER_CMD) rm -rf .pkg
@@ -323,6 +310,7 @@ clean-generated:
 	find $(TOP_SRC_DIRS) -type d -name *_generated | xargs git checkout --
 	# rollback openapi changes
 	git checkout -- pkg/openapi/openapi_generated.go
+	rm api_violations.txt
 
 # purge-generated removes generated files from the filesystem.
 purge-generated: .init $(scBuildImageTarget)

@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog/v1beta1"
+	"github.com/kubernetes-incubator/service-catalog/pkg/svcat/service-catalog"
 )
 
 func getPlanStatusShort(status v1beta1.ClusterServicePlanStatus) string {
@@ -34,7 +35,7 @@ func getPlanStatusShort(status v1beta1.ClusterServicePlanStatus) string {
 
 // ByAge implements sort.Interface for []Person based on
 // the Age field.
-type byClass []v1beta1.ClusterServicePlan
+type byClass []servicecatalog.Plan
 
 func (a byClass) Len() int {
 	return len(a)
@@ -43,65 +44,66 @@ func (a byClass) Swap(i, j int) {
 	a[i], a[j] = a[j], a[i]
 }
 func (a byClass) Less(i, j int) bool {
-	return a[i].Spec.ClusterServiceClassRef.Name < a[j].Spec.ClusterServiceClassRef.Name
+	return a[i].GetClassID() < a[j].GetClassID()
 }
 
-func writePlanListTable(w io.Writer, plans []v1beta1.ClusterServicePlan, classNames map[string]string) {
+func writePlanListTable(w io.Writer, plans []servicecatalog.Plan, classNames map[string]string) {
 
 	sort.Sort(byClass(plans))
 
 	t := NewListTable(w)
 	t.SetHeader([]string{
 		"Name",
+		"Namespace",
 		"Class",
 		"Description",
 	})
 	for _, plan := range plans {
 		t.Append([]string{
-			plan.Spec.ExternalName,
-			classNames[plan.Spec.ClusterServiceClassRef.Name],
-			plan.Spec.Description,
+			plan.GetExternalName(),
+			plan.GetNamespace(),
+			classNames[plan.GetClassID()],
+			plan.GetDescription(),
 		})
 	}
+	t.SetVariableColumn(4)
+
 	t.Render()
 }
 
 // WritePlanList prints a list of plans in the specified output format.
-func WritePlanList(w io.Writer, outputFormat string, plans []v1beta1.ClusterServicePlan, classes []v1beta1.ClusterServiceClass) {
+func WritePlanList(w io.Writer, outputFormat string, plans []servicecatalog.Plan, classes []servicecatalog.Class) {
 	classNames := map[string]string{}
 	for _, class := range classes {
-		classNames[class.Name] = class.Spec.ExternalName
-	}
-	list := v1beta1.ClusterServicePlanList{
-		Items: plans,
+		classNames[class.GetName()] = class.GetExternalName()
 	}
 	switch outputFormat {
-	case formatJSON:
-		writeJSON(w, list)
-	case formatYAML:
-		writeYAML(w, list, 0)
-	case formatTable:
+	case FormatJSON:
+		writeJSON(w, plans)
+	case FormatYAML:
+		writeYAML(w, plans, 0)
+	case FormatTable:
 		writePlanListTable(w, plans, classNames)
 	}
 }
 
 // WritePlan prints a single plan in the specified output format.
-func WritePlan(w io.Writer, outputFormat string, plan v1beta1.ClusterServicePlan, class v1beta1.ClusterServiceClass) {
+func WritePlan(w io.Writer, outputFormat string, plan servicecatalog.Plan, class v1beta1.ClusterServiceClass) {
 
 	switch outputFormat {
-	case formatJSON:
+	case FormatJSON:
 		writeJSON(w, plan)
-	case formatYAML:
+	case FormatYAML:
 		writeYAML(w, plan, 0)
-	case formatTable:
+	case FormatTable:
 		classNames := map[string]string{}
 		classNames[class.Name] = class.Spec.ExternalName
-		writePlanListTable(w, []v1beta1.ClusterServicePlan{plan}, classNames)
+		writePlanListTable(w, []servicecatalog.Plan{plan}, classNames)
 	}
 }
 
 // WriteAssociatedPlans prints a list of plans associated with a class.
-func WriteAssociatedPlans(w io.Writer, plans []v1beta1.ClusterServicePlan) {
+func WriteAssociatedPlans(w io.Writer, plans []servicecatalog.Plan) {
 	fmt.Fprintln(w, "\nPlans:")
 	if len(plans) == 0 {
 		fmt.Fprintln(w, "No plans defined")
@@ -115,8 +117,8 @@ func WriteAssociatedPlans(w io.Writer, plans []v1beta1.ClusterServicePlan) {
 	})
 	for _, plan := range plans {
 		t.Append([]string{
-			plan.Spec.ExternalName,
-			plan.Spec.Description,
+			plan.GetExternalName(),
+			plan.GetDescription(),
 		})
 	}
 	t.Render()
@@ -135,26 +137,36 @@ func WriteParentPlan(w io.Writer, plan *v1beta1.ClusterServicePlan) {
 }
 
 // WritePlanDetails prints details for a single plan.
-func WritePlanDetails(w io.Writer, plan *v1beta1.ClusterServicePlan, class *v1beta1.ClusterServiceClass) {
+func WritePlanDetails(w io.Writer, plan servicecatalog.Plan, class *v1beta1.ClusterServiceClass) {
 	t := NewDetailsTable(w)
 
 	t.AppendBulk([][]string{
-		{"Name:", plan.Spec.ExternalName},
-		{"Description:", plan.Spec.Description},
-		{"UUID:", string(plan.Name)},
-		{"Status:", getPlanStatusShort(plan.Status)},
-		{"Free:", strconv.FormatBool(plan.Spec.Free)},
+		{"Name:", plan.GetExternalName()},
+		{"Description:", plan.GetDescription()},
+		{"UUID:", string(plan.GetName())},
+		{"Status:", plan.GetShortStatus()},
+		{"Free:", strconv.FormatBool(plan.GetFree())},
 		{"Class:", class.Spec.ExternalName},
 	})
 
 	t.Render()
 }
 
+// WriteDefaultProvisionParameters prints the default provision parameters for a single plan.
+func WriteDefaultProvisionParameters(w io.Writer, plan servicecatalog.Plan) {
+	defaultProvisionParameters := plan.GetDefaultProvisionParameters()
+
+	if defaultProvisionParameters != nil {
+		fmt.Fprintln(w, "\nDefault Provision Parameters:")
+		writeYAML(w, defaultProvisionParameters, 2)
+	}
+}
+
 // WritePlanSchemas prints the schemas for a single plan.
-func WritePlanSchemas(w io.Writer, plan *v1beta1.ClusterServicePlan) {
-	instanceCreateSchema := plan.Spec.ServiceInstanceCreateParameterSchema
-	instanceUpdateSchema := plan.Spec.ServiceInstanceUpdateParameterSchema
-	bindingCreateSchema := plan.Spec.ServiceBindingCreateParameterSchema
+func WritePlanSchemas(w io.Writer, plan servicecatalog.Plan) {
+	instanceCreateSchema := plan.GetInstanceCreateSchema()
+	instanceUpdateSchema := plan.GetInstanceUpdateSchema()
+	bindingCreateSchema := plan.GetBindingCreateSchema()
 
 	if instanceCreateSchema != nil {
 		fmt.Fprintln(w, "\nInstance Create Parameter Schema:")

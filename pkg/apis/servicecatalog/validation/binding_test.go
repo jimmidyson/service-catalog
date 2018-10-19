@@ -62,6 +62,15 @@ func validServiceBindingPropertiesState() *servicecatalog.ServiceBindingProperti
 	}
 }
 
+func invalidServiceBindingStatusLastOperation() *string {
+	runes := make([]rune, 10001)
+	for i := range runes {
+		runes[i] = 'a'
+	}
+	lastOperation := string(runes)
+	return &lastOperation
+}
+
 func TestValidateServiceBinding(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -564,17 +573,27 @@ func TestValidateServiceBinding(t *testing.T) {
 			}(),
 			valid: true,
 		},
+		{
+			name: "LastOperation too long",
+			binding: func() *servicecatalog.ServiceBinding {
+				b := validServiceBindingWithInProgressBind()
+				b.Status.LastOperation = invalidServiceBindingStatusLastOperation()
+				return b
+			}(),
+			valid: false,
+		},
 	}
 
 	for _, tc := range cases {
-		errs := internalValidateServiceBinding(tc.binding, tc.create)
-		errs = append(errs, validateServiceBindingStatus(&tc.binding.Status, field.NewPath("status"), false)...)
-		if len(errs) != 0 && tc.valid {
-			t.Errorf("%v: unexpected error: %v", tc.name, errs)
-			continue
-		} else if len(errs) == 0 && !tc.valid {
-			t.Errorf("%v: unexpected success", tc.name)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			errs := internalValidateServiceBinding(tc.binding, tc.create)
+			errs = append(errs, validateServiceBindingStatus(&tc.binding.Status, field.NewPath("status"), false)...)
+			if len(errs) != 0 && tc.valid {
+				t.Errorf("unexpected error: %v", errs)
+			} else if len(errs) == 0 && !tc.valid {
+				t.Error("unexpected success")
+			}
+		})
 	}
 }
 
@@ -612,28 +631,29 @@ func TestInternalValidateServiceBindingUpdateAllowed(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		oldBinding := validServiceBinding()
-		if tc.onGoingSpecChange {
-			oldBinding.Generation = 2
-		} else {
-			oldBinding.Generation = 1
-		}
-		oldBinding.Status.ReconciledGeneration = 1
+		t.Run(tc.name, func(t *testing.T) {
+			oldBinding := validServiceBinding()
+			if tc.onGoingSpecChange {
+				oldBinding.Generation = 2
+			} else {
+				oldBinding.Generation = 1
+			}
+			oldBinding.Status.ReconciledGeneration = 1
 
-		newBinding := validServiceBinding()
-		if tc.newSpecChange {
-			newBinding.Generation = oldBinding.Generation + 1
-		} else {
-			newBinding.Generation = oldBinding.Generation
-		}
-		newBinding.Status.ReconciledGeneration = 1
+			newBinding := validServiceBinding()
+			if tc.newSpecChange {
+				newBinding.Generation = oldBinding.Generation + 1
+			} else {
+				newBinding.Generation = oldBinding.Generation
+			}
+			newBinding.Status.ReconciledGeneration = 1
 
-		errs := internalValidateServiceBindingUpdateAllowed(newBinding, oldBinding)
-		if len(errs) != 0 && tc.valid {
-			t.Errorf("%v: unexpected error: %v", tc.name, errs)
-			continue
-		} else if len(errs) == 0 && !tc.valid {
-			t.Errorf("%v: unexpected success", tc.name)
-		}
+			errs := internalValidateServiceBindingUpdateAllowed(newBinding, oldBinding)
+			if len(errs) != 0 && tc.valid {
+				t.Errorf("unexpected error: %v", errs)
+			} else if len(errs) == 0 && !tc.valid {
+				t.Error("unexpected success")
+			}
+		})
 	}
 }

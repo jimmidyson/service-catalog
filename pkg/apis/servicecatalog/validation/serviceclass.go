@@ -17,8 +17,6 @@ limitations under the License.
 package validation
 
 import (
-	"regexp"
-
 	apivalidation "k8s.io/apimachinery/pkg/api/validation"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -26,17 +24,9 @@ import (
 	sc "github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog"
 )
 
-const commonServiceClassNameFmt string = `[-.a-zA-Z0-9]+`
 const commonServiceClassNameMaxLength int = 63
 
-var commonServiceClassNameRegexp = regexp.MustCompile("^" + commonServiceClassNameFmt + "$")
-
-const guidFmt string = "[a-zA-Z0-9]([-a-zA-Z0-9.]*[a-zA-Z0-9])?"
 const guidMaxLength int = 63
-
-// guidRegexp is a loosened validation for
-// DNS1123 labels that allows uppercase characters.
-var guidRegexp = regexp.MustCompile("^" + guidFmt + "$")
 
 // validateCommonServiceClassName is the common validation function for
 // service class types.
@@ -45,8 +35,8 @@ func validateCommonServiceClassName(value string, prefix bool) []string {
 	if len(value) > commonServiceClassNameMaxLength {
 		errs = append(errs, utilvalidation.MaxLenError(commonServiceClassNameMaxLength))
 	}
-	if !commonServiceClassNameRegexp.MatchString(value) {
-		errs = append(errs, utilvalidation.RegexError(commonServiceClassNameFmt, "service-name-40d-0983-1b89"))
+	if len(value) == 0 {
+		errs = append(errs, utilvalidation.EmptyError())
 	}
 
 	return errs
@@ -64,8 +54,8 @@ func validateExternalID(value string) []string {
 	if len(value) > guidMaxLength {
 		errs = append(errs, utilvalidation.MaxLenError(guidMaxLength))
 	}
-	if !guidRegexp.MatchString(value) {
-		errs = append(errs, utilvalidation.RegexError(guidFmt, "my-name", "123-abc", "456-DEF"))
+	if len(value) == 0 {
+		errs = append(errs, utilvalidation.EmptyError())
 	}
 	return errs
 }

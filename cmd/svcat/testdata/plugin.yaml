@@ -60,6 +60,25 @@ tree:
     Svcat shell completion\\nsource '$HOME/.svcat/svcat_completion.bash.inc'\\n\"
     >> $HOME/.bash_profile\n  source $HOME/.bash_profile"
   command: ./svcat completion
+- name: create
+  use: create
+  shortDesc: Create a user-defined resource
+  command: ./svcat create
+  tree:
+  - name: class
+    use: class [NAME] --from [EXISTING_NAME]
+    shortDesc: Copies an existing class into a new user-defined cluster-scoped class
+    example: |2-
+        svcat create class newclass --from mysqldb
+        svcat create class newclass --from mysqldb --scope cluster
+        svcat create class newclass --from mysqldb --scope namespace --namespace newnamespace
+    command: ./svcat create class
+    flags:
+    - name: from
+      shorthand: f
+      desc: Name from an existing class that will be copied (Required)
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster or namespace'
 - name: deprovision
   use: deprovision NAME
   shortDesc: Deletes an instance of a service
@@ -69,6 +88,25 @@ tree:
   - name: interval
     desc: 'Poll interval for --wait, specified in human readable format: 30s, 1m,
       1h'
+  - name: timeout
+    desc: 'Timeout for --wait, specified in human readable format: 30s, 1m, 1h. Specify
+      -1 to wait indefinitely.'
+  - name: wait
+    desc: Wait until the operation completes.
+- name: deregister
+  use: deregister NAME
+  shortDesc: Deregisters an existing broker with service catalog
+  example: |2-
+      svcat deregister mysqlbroker
+      svcat deregister mysqlbroker --namespace=mysqlnamespace
+      svcat deregister mysqlclusterbroker --cluster
+  command: ./svcat deregister
+  flags:
+  - name: interval
+    desc: 'Poll interval for --wait, specified in human readable format: 30s, 1m,
+      1h'
+  - name: scope
+    desc: 'Limit the command to a particular scope: cluster or namespace'
   - name: timeout
     desc: 'Timeout for --wait, specified in human readable format: 30s, 1m, 1h. Specify
       -1 to wait indefinitely.'
@@ -115,8 +153,12 @@ tree:
     example: |2-
         svcat describe plan standard800
         svcat describe plan --uuid 08e4b43a-36bc-447e-a81f-8202b13e339c
+        svcat describe plan PLAN_NAME --scope cluster
+        svcat describe plan PLAN_NAME --scope namespace --namespace NAMESPACE_NAME
     command: ./svcat describe plan
     flags:
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster or namespace'
     - name: show-schemas
       desc: Whether or not to show instance and binding parameter schemas
     - name: uuid
@@ -129,7 +171,7 @@ tree:
   tree:
   - name: bindings
     use: bindings [NAME]
-    shortDesc: List bindings, optionally filtered by name
+    shortDesc: List bindings, optionally filtered by name or namespace
     example: |2-
         svcat get bindings
         svcat get bindings --all-namespaces
@@ -146,29 +188,43 @@ tree:
         present, defaults to table
   - name: brokers
     use: brokers [NAME]
-    shortDesc: List brokers, optionally filtered by name
+    shortDesc: List brokers, optionally filtered by name, scope or namespace
     example: |2-
         svcat get brokers
-        svcat get broker asb
+        svcat get brokers --scope=cluster
+        svcat get brokers --scope=all
+        svcat get broker minibroker
     command: ./svcat get brokers
     flags:
+    - name: all-namespaces
+      desc: If present, list the requested object(s) across all namespaces. Namespace
+        in current context is ignored even if specified with --namespace
     - name: output
       shorthand: o
       desc: The output format to use. Valid options are table, json or yaml. If not
         present, defaults to table
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster, namespace or all'
   - name: classes
     use: classes [NAME]
-    shortDesc: List classes, optionally filtered by name
+    shortDesc: List classes, optionally filtered by name, scope or namespace
     example: |2-
         svcat get classes
+        svcat get classes --scope cluster
+        svcat get classes --scope namespace --namespace dev
         svcat get class mysqldb
         svcat get class --uuid 997b8372-8dac-40ac-ae65-758b4a5075a5
     command: ./svcat get classes
     flags:
+    - name: all-namespaces
+      desc: If present, list the requested object(s) across all namespaces. Namespace
+        in current context is ignored even if specified with --namespace
     - name: output
       shorthand: o
       desc: The output format to use. Valid options are table, json or yaml. If not
         present, defaults to table
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster, namespace or all'
     - name: uuid
       shorthand: u
       desc: Whether or not to get the class by UUID (the default is by name)
@@ -199,9 +255,11 @@ tree:
       desc: If present, specify the plan used as a filter for this request
   - name: plans
     use: plans [NAME]
-    shortDesc: List plans, optionally filtered by name or class
+    shortDesc: List plans, optionally filtered by name, class, scope or namespace
     example: |2-
         svcat get plans
+        svcat get plans --scope cluster
+        svcat get plans --scope namespace --namespace dev
         svcat get plan PLAN_NAME
         svcat get plan CLASS_NAME/PLAN_NAME
         svcat get plan --uuid PLAN_UUID
@@ -211,6 +269,9 @@ tree:
         svcat get plan --uuid --class CLASS_UUID PLAN_UUID
     command: ./svcat get plans
     flags:
+    - name: all-namespaces
+      desc: If present, list the requested object(s) across all namespaces. Namespace
+        in current context is ignored even if specified with --namespace
     - name: class
       shorthand: c
       desc: Filter plans based on class. When --uuid is specified, the class name
@@ -219,9 +280,24 @@ tree:
       shorthand: o
       desc: The output format to use. Valid options are table, json or yaml. If not
         present, defaults to table
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster, namespace or all'
     - name: uuid
       shorthand: u
       desc: Whether or not to get the plan by UUID (the default is by name)
+- name: marketplace
+  use: marketplace
+  shortDesc: List available service offerings
+  example: "  svcat marketplace\n  \tsvcat marketplace --namespace dev"
+  command: ./svcat marketplace
+  flags:
+  - name: all-namespaces
+    desc: If present, list the requested object(s) across all namespaces. Namespace
+      in current context is ignored even if specified with --namespace
+  - name: output
+    shorthand: o
+    desc: The output format to use. Valid options are table, json or yaml. If not
+      present, defaults to table
 - name: provision
   use: provision NAME --plan PLAN --class CLASS
   shortDesc: Create a new instance of a service
@@ -266,6 +342,44 @@ tree:
       -1 to wait indefinitely.'
   - name: wait
     desc: Wait until the operation completes.
+- name: register
+  use: register NAME --url URL
+  shortDesc: Registers a new broker with service catalog
+  example: '  svcat register mysqlbroker --url http://mysqlbroker.com'
+  command: ./svcat register
+  flags:
+  - name: basic-secret
+    desc: A secret containing basic auth (username/password) information to connect
+      to the broker
+  - name: bearer-secret
+    desc: A secret containing a bearer token to connect to the broker
+  - name: ca
+    desc: A file containing the CA certificate to connect to the broker
+  - name: class-restrictions
+    desc: A list of restrictions to apply to the classes allowed from the broker
+  - name: interval
+    desc: 'Poll interval for --wait, specified in human readable format: 30s, 1m,
+      1h'
+  - name: plan-restrictions
+    desc: A list of restrictions to apply to the plans allowed from the broker
+  - name: relist-behavior
+    desc: Behavior for relisting the broker's catalog. Valid options are manual or
+      duration. Defaults to duration with an interval of 15m.
+  - name: relist-duration
+    desc: 'Interval to refetch broker catalog when relist-behavior is set to duration,
+      specified in human readable format: 30s, 1m, 1h'
+  - name: scope
+    desc: 'Limit the command to a particular scope: cluster or namespace'
+  - name: skip-tls
+    desc: Disables TLS certificate verification when communicating with this broker.
+      This is strongly discouraged. You should use --ca instead.
+  - name: timeout
+    desc: 'Timeout for --wait, specified in human readable format: 30s, 1m, 1h. Specify
+      -1 to wait indefinitely.'
+  - name: url
+    desc: The broker URL (Required)
+  - name: wait
+    desc: Wait until the operation completes.
 - name: sync
   use: sync
   shortDesc: Syncs service catalog for a service broker
@@ -276,6 +390,9 @@ tree:
     shortDesc: Syncs service catalog for a service broker
     example: '  svcat sync broker asb'
     command: ./svcat sync broker
+    flags:
+    - name: scope
+      desc: 'Limit the command to a particular scope: cluster or namespace'
 - name: touch
   use: touch
   shortDesc: Force Service Catalog to reprocess a resource

@@ -21,11 +21,12 @@ import (
 	"errors"
 	"fmt"
 
-	scmeta "github.com/kubernetes-incubator/service-catalog/pkg/api/meta"
 	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog"
 	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/server"
+	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/tableconvertor"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -89,8 +90,7 @@ func Match(label labels.Selector, field fields.Selector) storage.SelectionPredic
 
 // toSelectableFields returns a field set that represents the object for matching purposes.
 func toSelectableFields(broker *servicecatalog.ServiceBroker) fields.Set {
-	objectMetaFieldsSet := generic.ObjectMetaFieldsSet(&broker.ObjectMeta, true)
-	return generic.MergeFieldsSets(objectMetaFieldsSet, nil)
+	return generic.ObjectMetaFieldsSet(&broker.ObjectMeta, true)
 }
 
 // GetAttrs returns labels and fields of a given object for filtering purposes.
@@ -104,30 +104,11 @@ func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
 
 // NewStorage creates a new rest.Storage responsible for accessing
 // ServiceBroker resources
-func NewStorage(opts server.Options) (serviceBrokers, serviceBrokerStatus rest.Storage) {
-	prefix := "/" + opts.ResourcePrefix()
-
-	storageInterface, dFunc := opts.GetStorage(
-		&servicecatalog.ServiceBroker{},
-		prefix,
-		serviceBrokerRESTStrategies,
-		NewList,
-		nil,
-		storage.NoTriggerPublisher,
-	)
-
+func NewStorage(optsGetter generic.RESTOptionsGetter) (serviceBrokers, serviceBrokerStatus rest.Storage, err error) {
 	store := registry.Store{
-		NewFunc:     EmptyObject,
-		NewListFunc: NewList,
-		KeyRootFunc: opts.KeyRootFunc(),
-		KeyFunc:     opts.KeyFunc(true),
-		// Retrieve the name field of the resource.
-		ObjectNameFunc: func(obj runtime.Object) (string, error) {
-			return scmeta.GetAccessor().Name(obj)
-		},
-		// Used to match objects based on labels/fields for list.
-		PredicateFunc: Match,
-		// DefaultQualifiedResource should always be plural
+		NewFunc:                  func() runtime.Object { return &servicecatalog.ServiceBroker{} },
+		NewListFunc:              func() runtime.Object { return &servicecatalog.ServiceBrokerList{} },
+		PredicateFunc:            Match,
 		DefaultQualifiedResource: servicecatalog.Resource("servicebrokers"),
 
 		CreateStrategy:          serviceBrokerRESTStrategies,
@@ -135,19 +116,48 @@ func NewStorage(opts server.Options) (serviceBrokers, serviceBrokerStatus rest.S
 		DeleteStrategy:          serviceBrokerRESTStrategies,
 		EnableGarbageCollection: true,
 
+		TableConvertor: tableconvertor.NewTableConvertor(
+			[]metav1beta1.TableColumnDefinition{
+				{Name: "Name", Type: "string", Format: "name"},
+				{Name: "URL", Type: "string"},
+				{Name: "Status", Type: "string"},
+				{Name: "Age", Type: "string"},
+			},
+			func(obj runtime.Object, m metav1.Object, name, age string) ([]interface{}, error) {
+				getStatus := func(status servicecatalog.CommonServiceBrokerStatus) string {
+					if len(status.Conditions) > 0 {
+						condition := status.Conditions[len(status.Conditions)-1]
+						if condition.Status == servicecatalog.ConditionTrue {
+							return string(condition.Type)
+						}
+						return condition.Reason
+					}
+					return ""
+				}
+				broker := obj.(*servicecatalog.ServiceBroker)
+				cells := []interface{}{
+					name,
+					broker.Spec.URL,
+					getStatus(broker.Status.CommonServiceBrokerStatus),
+					age,
+				}
+				return cells, nil
+			},
+		),
+
 		Storage:     storageInterface,
 		DestroyFunc: dFunc,
 	}
 
-	options := &generic.StoreOptions{RESTOptions: opts.EtcdOptions.RESTOptions, AttrFunc: GetAttrs}
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: GetAttrs}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, nil, err
 	}
 
 	statusStore := store
 	statusStore.UpdateStrategy = serviceBrokerStatusUpdateStrategy
 
-	return &store, &StatusREST{&statusStore}
+	return &store, &StatusREST{&statusStore}, nil
 }
 
 // StatusREST defines the REST operations for the status subresource via
@@ -176,6 +186,6 @@ func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOp
 
 // Update alters the status subset of an object and implements the
 // rest.Updater interface.
-func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, forceAllowCreate, options)
 }

@@ -93,24 +93,6 @@ func TestValidateClusterServicePlan(t *testing.T) {
 			valid: false,
 		},
 		{
-			name: "bad name",
-			clusterServicePlan: func() *servicecatalog.ClusterServicePlan {
-				s := validClusterServicePlan()
-				s.Name = "#"
-				return s
-			}(),
-			valid: false,
-		},
-		{
-			name: "bad externalName",
-			clusterServicePlan: func() *servicecatalog.ClusterServicePlan {
-				s := validClusterServicePlan()
-				s.Spec.ExternalName = "#"
-				return s
-			}(),
-			valid: false,
-		},
-		{
 			name: "mixed case Name",
 			clusterServicePlan: func() *servicecatalog.ClusterServicePlan {
 				s := validClusterServicePlan()
@@ -185,15 +167,6 @@ func TestValidateClusterServicePlan(t *testing.T) {
 			}(),
 			valid: false,
 		},
-		{
-			name: "bad serviceclass reference name",
-			clusterServicePlan: func() *servicecatalog.ClusterServicePlan {
-				s := validClusterServicePlan()
-				s.Spec.ClusterServiceClassRef.Name = "%"
-				return s
-			}(),
-			valid: false,
-		},
 	}
 	for _, tc := range testCases {
 		tc := tc
@@ -202,9 +175,9 @@ func TestValidateClusterServicePlan(t *testing.T) {
 			errs := ValidateClusterServicePlan(tc.clusterServicePlan)
 			t.Log(errs)
 			if len(errs) != 0 && tc.valid {
-				t.Errorf("%v: unexpected error: %v", tc.name, errs)
+				t.Errorf("unexpected error: %v", errs)
 			} else if len(errs) == 0 && !tc.valid {
-				t.Errorf("%v: unexpected success", tc.name)
+				t.Error("unexpected success")
 			}
 		})
 	}
@@ -235,24 +208,6 @@ func TestValidateServicePlan(t *testing.T) {
 			servicePlan: func() *servicecatalog.ServicePlan {
 				s := validServicePlan()
 				s.Name = ""
-				return s
-			}(),
-			valid: false,
-		},
-		{
-			name: "bad name",
-			servicePlan: func() *servicecatalog.ServicePlan {
-				s := validServicePlan()
-				s.Name = "#"
-				return s
-			}(),
-			valid: false,
-		},
-		{
-			name: "bad externalName",
-			servicePlan: func() *servicecatalog.ServicePlan {
-				s := validServicePlan()
-				s.Spec.ExternalName = "#"
 				return s
 			}(),
 			valid: false,
@@ -333,15 +288,6 @@ func TestValidateServicePlan(t *testing.T) {
 			valid: false,
 		},
 		{
-			name: "bad serviceclass reference name",
-			servicePlan: func() *servicecatalog.ServicePlan {
-				s := validServicePlan()
-				s.Spec.ServiceClassRef.Name = "%"
-				return s
-			}(),
-			valid: false,
-		},
-		{
 			name: "missing namespace",
 			servicePlan: func() *servicecatalog.ServicePlan {
 				s := validServicePlan()
@@ -360,9 +306,9 @@ func TestValidateServicePlan(t *testing.T) {
 			errs := ValidateServicePlan(tc.servicePlan)
 			t.Log(errs)
 			if len(errs) != 0 && tc.valid {
-				t.Errorf("%v: unexpected error: %v", tc.name, errs)
+				t.Errorf("unexpected error: %v", errs)
 			} else if len(errs) == 0 && !tc.valid {
-				t.Errorf("%v: unexpected success", tc.name)
+				t.Error("unexpected success")
 			}
 		})
 	}
@@ -409,9 +355,9 @@ func TestValidateClusterServicePlanUpdate(t *testing.T) {
 			errs := ValidateClusterServicePlanUpdate(tc.new, tc.old)
 			t.Log(errs)
 			if len(errs) != 0 && tc.valid {
-				t.Errorf("%v: unexpected error: %v", tc.name, errs)
+				t.Errorf("unexpected error: %v", errs)
 			} else if len(errs) == 0 && !tc.valid {
-				t.Errorf("%v: unexpected success", tc.name)
+				t.Error("unexpected success")
 			}
 		})
 	}
@@ -458,9 +404,9 @@ func TestValidateServicePlanUpdate(t *testing.T) {
 			errs := ValidateServicePlanUpdate(tc.new, tc.old)
 			t.Log(errs)
 			if len(errs) != 0 && tc.valid {
-				t.Errorf("%v: unexpected error: %v", tc.name, errs)
+				t.Errorf("unexpected error: %v", errs)
 			} else if len(errs) == 0 && !tc.valid {
-				t.Errorf("%v: unexpected success", tc.name)
+				t.Error("unexpected success")
 			}
 		})
 	}

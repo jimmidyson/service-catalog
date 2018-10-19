@@ -57,4 +57,8 @@ tocs:
   - cli
   - concepts
   - resources
+  - namespaced-broker-resources
+  - catalog-restrictions
+  - service-plan-defaults
+  - ladder
   - docs-home # fallthrough, leave this last

@@ -22,36 +22,38 @@ import (
 
 	"github.com/kubernetes-incubator/service-catalog/cmd/svcat/command"
 	"github.com/kubernetes-incubator/service-catalog/cmd/svcat/output"
-	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog/v1beta1"
 	"github.com/kubernetes-incubator/service-catalog/pkg/svcat/service-catalog"
 	"github.com/spf13/cobra"
 )
 
 type getCmd struct {
-	*command.Context
+	*command.Namespaced
+	*command.Scoped
+	*command.Formatted
 	lookupByUUID bool
 	uuid         string
 	name         string
 
-	classFilter  string
-	classUUID    string
-	className    string
-	outputFormat string
-}
-
-func (c *getCmd) SetFormat(format string) {
-	c.outputFormat = format
+	classFilter string
+	classUUID   string
+	className   string
 }
 
 // NewGetCmd builds a "svcat get plans" command
-func NewGetCmd(cxt *command.Context) *cobra.Command {
-	getCmd := &getCmd{Context: cxt}
+func NewGetCmd(ctx *command.Context) *cobra.Command {
+	getCmd := &getCmd{
+		Namespaced: command.NewNamespaced(ctx),
+		Scoped:     command.NewScoped(),
+		Formatted:  command.NewFormatted(),
+	}
 	cmd := &cobra.Command{
 		Use:     "plans [NAME]",
 		Aliases: []string{"plan", "pl"},
-		Short:   "List plans, optionally filtered by name or class",
+		Short:   "List plans, optionally filtered by name, class, scope or namespace",
 		Example: command.NormalizeExamples(`
   svcat get plans
+  svcat get plans --scope cluster
+  svcat get plans --scope namespace --namespace dev
   svcat get plan PLAN_NAME
   svcat get plan CLASS_NAME/PLAN_NAME
   svcat get plan --uuid PLAN_UUID
@@ -77,7 +79,9 @@ func NewGetCmd(cxt *command.Context) *cobra.Command {
 		"",
 		"Filter plans based on class. When --uuid is specified, the class name is interpreted as a uuid.",
 	)
-	command.AddOutputFlags(cmd.Flags())
+	getCmd.AddOutputFlags(cmd.Flags())
+	getCmd.AddNamespaceFlags(cmd.Flags(), true)
+	getCmd.AddScopedFlags(cmd.Flags(), true)
 	return cmd
 }
 
@@ -117,62 +121,73 @@ func (c *getCmd) Run() error {
 
 func (c *getCmd) getAll() error {
 
-	var opts *servicecatalog.FilterOptions
-
 	// Retrieve the classes as well because plans don't have the external class name
-	classes, err := c.App.RetrieveClasses()
+	classOpts := servicecatalog.ScopeOptions{
+		Namespace: c.Namespace,
+		Scope:     c.Scope,
+	}
+	classes, err := c.App.RetrieveClasses(classOpts)
 	if err != nil {
 		return fmt.Errorf("unable to list classes (%s)", err)
 	}
 
+	var classID string
+	opts := servicecatalog.ScopeOptions{
+		Namespace: c.Namespace,
+		Scope:     c.Scope,
+	}
 	if c.classFilter != "" {
 		if !c.lookupByUUID {
 			// Map the external class name to the class name.
 			for _, class := range classes {
-				if c.className == class.Spec.ExternalName {
-					c.classUUID = class.Name
+				if c.className == class.GetExternalName() {
+					c.classUUID = class.GetName()
 					break
 				}
 			}
 		}
-		opts = &servicecatalog.FilterOptions{
-			ClassID: c.classUUID,
-		}
+		classID = c.classUUID
 	}
 
-	plans, err := c.App.RetrievePlans(opts)
+	plans, err := c.App.RetrievePlans(classID, opts)
 	if err != nil {
 		return fmt.Errorf("unable to list plans (%s)", err)
 	}
 
-	output.WritePlanList(c.Output, c.outputFormat, plans, classes)
+	output.WritePlanList(c.Output, c.OutputFormat, plans, classes)
 	return nil
 }
 
 func (c *getCmd) get() error {
-	var plan *v1beta1.ClusterServicePlan
+	var plan servicecatalog.Plan
 	var err error
+
+	opts := servicecatalog.ScopeOptions{
+		Namespace: c.Namespace,
+		Scope:     c.Scope,
+	}
+
 	switch {
 	case c.lookupByUUID:
-		plan, err = c.App.RetrievePlanByID(c.uuid)
+		plan, err = c.App.RetrievePlanByID(c.uuid, opts)
 
 	case c.className != "":
-		plan, err = c.App.RetrievePlanByClassAndPlanNames(c.className, c.name)
+		plan, err = c.App.RetrievePlanByClassAndName(c.className, c.name, opts)
 
 	default:
-		plan, err = c.App.RetrievePlanByName(c.name)
+		plan, err = c.App.RetrievePlanByName(c.name, opts)
 
 	}
 	if err != nil {
 		return err
 	}
 	// Retrieve the class as well because plans don't have the external class name
-	class, err := c.App.RetrieveClassByID(plan.Spec.ClusterServiceClassRef.Name)
+	class, err := c.App.RetrieveClassByID(plan.GetClassID())
 	if err != nil {
 		return err
 	}
 
-	output.WritePlan(c.Output, c.outputFormat, *plan, *class)
+	output.WritePlan(c.Output, c.OutputFormat, plan, *class)
 
 	return nil
 }

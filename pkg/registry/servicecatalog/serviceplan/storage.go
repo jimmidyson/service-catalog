@@ -21,10 +21,11 @@ import (
 	"errors"
 	"fmt"
 
-	scmeta "github.com/kubernetes-incubator/service-catalog/pkg/api/meta"
 	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog"
 	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/server"
+	"github.com/kubernetes-incubator/service-catalog/pkg/registry/servicecatalog/tableconvertor"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -113,43 +114,46 @@ func GetAttrs(obj runtime.Object) (labels.Set, fields.Set, bool, error) {
 
 // NewStorage creates a new rest.Storage responsible for accessing
 // ServicePlan resources
-func NewStorage(opts server.Options) (rest.Storage, rest.Storage) {
-	prefix := "/" + opts.ResourcePrefix()
-
-	storageInterface, dFunc := opts.GetStorage(
-		&servicecatalog.ServicePlan{},
-		prefix,
-		servicePlanRESTStrategies,
-		NewList,
-		nil,
-		storage.NoTriggerPublisher,
-	)
-
+func NewStorage(optsGetter generic.RESTOptionsGetter) (servicePlans, servicePlanStatus rest.Storage, err error) {
 	store := registry.Store{
-		NewFunc:     EmptyObject,
-		NewListFunc: NewList,
-		KeyRootFunc: opts.KeyRootFunc(),
-		KeyFunc:     opts.KeyFunc(true),
-		// Retrieve the name field of the resource.
-		ObjectNameFunc: func(obj runtime.Object) (string, error) {
-			return scmeta.GetAccessor().Name(obj)
-		},
-		// Used to match objects based on labels/fields for list.
-		PredicateFunc: Match,
-		// DefaultQualifiedResource should always be plural
+		NewFunc:                  func() runtime.Object { return &servicecatalog.ServicePlan{} },
+		NewListFunc:              func() runtime.Object { return &servicecatalog.ServicePlanList{} },
+		PredicateFunc:            Match,
 		DefaultQualifiedResource: servicecatalog.Resource("serviceplans"),
 
 		CreateStrategy: servicePlanRESTStrategies,
 		UpdateStrategy: servicePlanRESTStrategies,
 		DeleteStrategy: servicePlanRESTStrategies,
-		Storage:        storageInterface,
-		DestroyFunc:    dFunc,
+
+		TableConvertor: tableconvertor.NewTableConvertor(
+			[]metav1beta1.TableColumnDefinition{
+				{Name: "Name", Type: "string", Format: "name"},
+				{Name: "External-Name", Type: "string"},
+				{Name: "Broker", Type: "string"},
+				{Name: "Class", Type: "string"},
+				{Name: "Age", Type: "string"},
+			},
+			func(obj runtime.Object, m metav1.Object, name, age string) ([]interface{}, error) {
+				plan := obj.(*servicecatalog.ServicePlan)
+				cells := []interface{}{
+					name,
+					plan.Spec.ExternalName,
+					plan.Spec.ServiceBrokerName,
+					plan.Spec.ServiceClassRef.Name,
+					age,
+				}
+				return cells, nil
+			},
+		),
+
+		Storage:     storageInterface,
+		DestroyFunc: dFunc,
 	}
 
 	statusStore := store
 	statusStore.UpdateStrategy = servicePlanStatusUpdateStrategy
 
-	return &store, &StatusREST{&statusStore}
+	return &store, &StatusREST{&statusStore}, nil
 }
 
 // StatusREST defines the REST operations for the status subresource via
@@ -178,6 +182,6 @@ func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOp
 
 // Update alters the status subset of an object and it
 // implements rest.Updater interface
-func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, forceAllowCreate, options)
 }

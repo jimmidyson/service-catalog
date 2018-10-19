@@ -20,6 +20,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -34,10 +35,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 
 	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog/v1beta1"
 	scfeatures "github.com/kubernetes-incubator/service-catalog/pkg/features"
 	"github.com/kubernetes-incubator/service-catalog/pkg/pretty"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
@@ -99,18 +102,45 @@ const (
 	startingInstanceOrphanMitigationMessage string = "The instance provision call failed with an ambiguous error; attempting to deprovision the instance in order to mitigate an orphaned resource"
 
 	clusterIdentifierKey string = "clusterid"
+
+	minBrokerOperationRetryDelay time.Duration = time.Second * 1
+	maxBrokerOperationRetryDelay time.Duration = time.Minute * 20
 )
+
+type backoffEntry struct {
+	generation          int64
+	calculatedRetryTime time.Time // earliest time we should retry
+	dirty               bool      // true indicates new backoff should be calculated
+}
+
+type instanceOperationBackoff struct {
+	// lock to be used for accessing retry map
+	mutex       sync.RWMutex
+	instances   map[string]backoffEntry // Key is K8s metadata UID
+	rateLimiter workqueue.RateLimiter   // used to calculate next retry time, key is UID
+}
 
 // ServiceInstance handlers and control-loop
 
+// instanceAdd adds the instance key to the work queue
 func (c *controller) instanceAdd(obj interface{}) {
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
 		return
 	}
-
 	c.instanceQueue.Add(key)
+}
+
+// instanceAddAfter adds the instance key to the work queue after the specified
+// duration elapses
+func (c *controller) instanceAddAfter(obj interface{}, d time.Duration) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		return
+	}
+	c.instanceQueue.AddAfter(key, d)
 }
 
 func (c *controller) instanceUpdate(oldObj, newObj interface{}) {
@@ -341,6 +371,113 @@ func (c *controller) initOrphanMitigationCondition(instance *v1beta1.ServiceInst
 	return false, nil
 }
 
+// setRetryBackoffRequired marks the specified instance/generation as needing a
+// delay before the next provision/update is attempted.  We always set this flag
+// before attempting a provision or update operation in case we must retry.  This
+// will eventually be cleared by the background worker running
+// purgeExpiredRetryEntries() or when the operation is successful.
+func (c *controller) setRetryBackoffRequired(instance *v1beta1.ServiceInstance) {
+	pcb := pretty.NewInstanceContextBuilder(instance)
+	c.instanceOperationRetryQueue.mutex.Lock()
+	defer c.instanceOperationRetryQueue.mutex.Unlock()
+	key := string(instance.GetUID())
+	retryEntry, found := c.instanceOperationRetryQueue.instances[key]
+	if !found || retryEntry.generation != instance.Generation {
+		retryEntry.generation = instance.Generation
+
+		// reset the backoff as the generation changed
+		if found {
+			c.instanceOperationRetryQueue.rateLimiter.Forget(key)
+		}
+	}
+	retryEntry.dirty = true
+	c.instanceOperationRetryQueue.instances[key] = retryEntry
+	glog.V(4).Info(pcb.Messagef("BrokerOpRetry: added %v (%v/%v) generation %v to backoffBeforeRetrying map", key, instance.GetNamespace(), instance.GetName(), instance.Generation))
+}
+
+// backoffAndRequeueIfRetrying returns true if this is a retry and a backoff
+// (delay) needs to be observed before retrying.  This only applies to
+// Provisioning and Updating and is generation specific.  If the generation has
+// been bumped since the instance was added to the retry map there will be no
+// backoff delay.
+func (c *controller) backoffAndRequeueIfRetrying(instance *v1beta1.ServiceInstance, operation string) bool {
+	pcb := pretty.NewInstanceContextBuilder(instance)
+	key := string(instance.GetUID())
+	delay := time.Millisecond * 0
+
+	// if there is a pending delay, calculate it and clear the dirty bit
+	c.instanceOperationRetryQueue.mutex.Lock()
+	defer c.instanceOperationRetryQueue.mutex.Unlock()
+	retryEntry, exists := c.instanceOperationRetryQueue.instances[key]
+	if exists {
+		if retryEntry.generation != instance.Generation {
+			// the retry entry was on an old generation, we don't care,
+			// cleanup and no delay
+			delete(c.instanceOperationRetryQueue.instances, key)
+			c.instanceOperationRetryQueue.rateLimiter.Forget(key)
+			return false
+		}
+		if retryEntry.dirty {
+			// calculate earliest retry time with exponential backoff
+			retryEntry.calculatedRetryTime = time.Now().Add(c.instanceOperationRetryQueue.rateLimiter.When(key))
+			retryEntry.dirty = false
+			c.instanceOperationRetryQueue.instances[key] = retryEntry
+			glog.V(4).Infof(pcb.Messagef("BrokerOpRetry: generation %v retryTime calculated as %v", instance.Generation, retryEntry.calculatedRetryTime))
+		}
+
+		now := time.Now()
+		delay = retryEntry.calculatedRetryTime.Sub(now)
+
+		if delay > 0 {
+			msg := fmt.Sprintf("Delaying %s retry, next attempt will be after %s", operation, retryEntry.calculatedRetryTime)
+			c.recorder.Event(instance, corev1.EventTypeWarning, "RetryBackoff", msg)
+			glog.V(2).Info(pcb.Messagef("BrokerOpRetry: %s", msg))
+
+			// add back to worker queue to retry at the specified time
+			c.instanceAddAfter(instance, delay)
+			return true
+		}
+	}
+	return false
+}
+
+// purgeExpiredRetryEntries clears entries from the map that have an expired
+// retry time.  Invoked by a worker on a timer.
+func (c *controller) purgeExpiredRetryEntries() {
+	now := time.Now()
+
+	c.instanceOperationRetryQueue.mutex.Lock()
+	defer c.instanceOperationRetryQueue.mutex.Unlock()
+
+	// Ensure we only purge items that aren't being acted on by retries.
+	// Due to queues and potential delays, only remove entries that are at
+	// least maxBrokerOperationRetryDelay past next retry time to ensure
+	// entries are not prematurely removed
+	overDue := now.Add(-maxBrokerOperationRetryDelay)
+	purgedEntries := 0
+	for k, v := range c.instanceOperationRetryQueue.instances {
+		if v.calculatedRetryTime.Before(overDue) {
+			glog.V(5).Infof("BrokerOpRetry: removing %s from instanceOperationRetryQueue which had retry time of %v", k, v.calculatedRetryTime)
+			delete(c.instanceOperationRetryQueue.instances, k)
+			c.instanceOperationRetryQueue.rateLimiter.Forget(k)
+			purgedEntries++
+		}
+	}
+	glog.V(5).Infof("BrokerOpRetry: purged %v expired entries from instanceOperationRetryQueue.instances, number of entries remaining: %v", purgedEntries, len(c.instanceOperationRetryQueue.instances))
+
+}
+
+// removeInstanceFromRetryMap removes the instance from the retry & ratelimter maps
+func (c *controller) removeInstanceFromRetryMap(instance *v1beta1.ServiceInstance) {
+	pcb := pretty.NewInstanceContextBuilder(instance)
+	key := string(instance.GetUID())
+	c.instanceOperationRetryQueue.mutex.Lock()
+	defer c.instanceOperationRetryQueue.mutex.Unlock()
+	delete(c.instanceOperationRetryQueue.instances, key)
+	c.instanceOperationRetryQueue.rateLimiter.Forget(key)
+	glog.V(4).Infof(pcb.Message("BrokerOpRetry: removed %v from instanceOperationRetryQueue"), key)
+}
+
 // reconcileServiceInstanceAdd is responsible for handling the provisioning
 // of new service instances.
 func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstance) error {
@@ -348,6 +485,12 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 
 	if isServiceInstanceProcessedAlready(instance) {
 		glog.V(4).Info(pcb.Message("Not processing event because status showed there is no work to do"))
+		return nil
+	}
+
+	// don't DOS the broker.  If we already did a provision attempt that ended with a non-terminal
+	// error wait for the exponential backoff to pass
+	if c.backoffAndRequeueIfRetrying(instance, "provision") {
 		return nil
 	}
 
@@ -367,6 +510,18 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 		return nil
 	}
 
+	if utilfeature.DefaultFeatureGate.Enabled(scfeatures.ServicePlanDefaults) {
+		// Apply default provisioning parameters, this must be done after we've resolved the class and plan
+		modified, err = c.applyDefaultProvisioningParameters(instance)
+		if err != nil {
+			return err
+		}
+		if modified {
+			// the instance was updated with new parameters, so we need to continue in the next iteration
+			return nil
+		}
+	}
+
 	glog.V(4).Info(pcb.Message("Processing adding event"))
 
 	request, inProgressProperties, err := c.prepareProvisionRequest(instance)
@@ -382,6 +537,16 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 			return err
 		}
 		// recordStartOfServiceInstanceOperation has updated the instance, so we need to continue in the next iteration
+		return nil
+	} else if instance.Status.DeprovisionStatus != v1beta1.ServiceInstanceDeprovisionStatusRequired {
+		instance.Status.DeprovisionStatus = v1beta1.ServiceInstanceDeprovisionStatusRequired
+		instance, err = c.updateServiceInstanceStatus(instance)
+		if err != nil {
+			// There has been an update to the instance. Start reconciliation
+			// over with a fresh view of the instance.
+			return err
+		}
+		// instance was updated, we will to continue in the next iteration
 		return nil
 	}
 
@@ -403,6 +568,7 @@ func (c *controller) reconcileServiceInstanceAdd(instance *v1beta1.ServiceInstan
 		prettyClass, brokerName,
 	))
 
+	c.setRetryBackoffRequired(instance)
 	response, err := brokerClient.ProvisionInstance(request)
 	if err != nil {
 		if httpErr, ok := osb.IsHTTPError(err); ok {
@@ -460,6 +626,12 @@ func (c *controller) reconcileServiceInstanceUpdate(instance *v1beta1.ServiceIns
 
 	if isServiceInstanceProcessedAlready(instance) {
 		glog.V(4).Info(pcb.Message("Not processing event because status showed there is no work to do"))
+		return nil
+	}
+
+	// don't DOS the broker.  If we already did an update attempt that ended with a non-terminal
+	// error wait for the exponential backoff to pass
+	if c.backoffAndRequeueIfRetrying(instance, "update") {
 		return nil
 	}
 
@@ -559,6 +731,7 @@ func (c *controller) reconcileServiceInstanceUpdate(instance *v1beta1.ServiceIns
 		))
 	}
 
+	c.setRetryBackoffRequired(instance)
 	response, err := brokerClient.UpdateInstance(request)
 	if err != nil {
 		if httpErr, ok := osb.IsHTTPError(err); ok {
@@ -791,19 +964,27 @@ func (c *controller) pollServiceInstance(instance *v1beta1.ServiceInstance) erro
 			return c.finishPollingServiceInstance(instance)
 		}
 
-		// We got some kind of error and should continue polling.
-		//
-		// The instance's Ready condition should already be False, so
-		// we just need to record an event.
-		s := fmt.Sprintf("Error polling last operation: %v", err)
-		glog.V(4).Info(pcb.Message(s))
-		c.recorder.Event(instance, corev1.EventTypeWarning, errorPollingLastOperationReason, s)
+		reason := errorPollingLastOperationReason
+		message := fmt.Sprintf("Error polling last operation: %v", err)
+		glog.V(4).Info(pcb.Message(message))
+		readyCond := newServiceInstanceReadyCondition(v1beta1.ConditionFalse, reason, message)
 
 		if c.reconciliationRetryDurationExceeded(instance.Status.OperationStartTime) {
-			return c.processServiceInstancePollingFailureRetryTimeout(instance, nil)
+			return c.processServiceInstancePollingFailureRetryTimeout(instance, readyCond)
 		}
 
-		return c.continuePollingServiceInstance(instance)
+		if httpErr, ok := osb.IsHTTPError(err); ok {
+			if isRetriableHTTPStatus(httpErr.StatusCode) {
+				return c.processServiceInstancePollingTemporaryFailure(instance, readyCond)
+			}
+			// A failure with a given HTTP response code is treated as a terminal
+			// failure.
+			failedCond := newServiceInstanceFailedCondition(v1beta1.ConditionTrue, reason, message)
+			return c.processServiceInstancePollingTerminalFailure(instance, readyCond, failedCond)
+		}
+
+		// Unknown error: update status and continue polling
+		return c.processServiceInstancePollingTemporaryFailure(instance, readyCond)
 	}
 
 	description := "(no description provided)"
@@ -896,9 +1077,11 @@ func (c *controller) pollServiceInstance(instance *v1beta1.ServiceInstance) erro
 
 		return c.finishPollingServiceInstance(instance)
 	default:
-		glog.Warning(pcb.Messagef("Got invalid state in LastOperationResponse: %q", response.State))
+		message := pcb.Messagef("Got invalid state in LastOperationResponse: %q", response.State)
+		glog.Warning(message)
 		if c.reconciliationRetryDurationExceeded(instance.Status.OperationStartTime) {
-			return c.processServiceInstancePollingFailureRetryTimeout(instance, nil)
+			readyCond := newServiceInstanceReadyCondition(v1beta1.ConditionUnknown, errorPollingLastOperationReason, message)
+			return c.processServiceInstancePollingFailureRetryTimeout(instance, readyCond)
 		}
 
 		err := fmt.Errorf(`Got invalid state in LastOperationResponse: %q`, response.State)
@@ -928,12 +1111,17 @@ func isServiceInstanceProcessedAlready(instance *v1beta1.ServiceInstance) bool {
 // processServiceInstancePollingFailureRetryTimeout marks the instance as having
 // failed polling due to its reconciliation retry duration expiring
 func (c *controller) processServiceInstancePollingFailureRetryTimeout(instance *v1beta1.ServiceInstance, readyCond *v1beta1.ServiceInstanceCondition) error {
+	msg := "Stopping reconciliation retries because too much time has elapsed"
+	failedCond := newServiceInstanceFailedCondition(v1beta1.ConditionTrue, errorReconciliationRetryTimeoutReason, msg)
+	return c.processServiceInstancePollingTerminalFailure(instance, readyCond, failedCond)
+}
+
+// processServiceInstancePollingTerminalFailure marks the instance as having
+// failed polling due to terminal error
+func (c *controller) processServiceInstancePollingTerminalFailure(instance *v1beta1.ServiceInstance, readyCond, failedCond *v1beta1.ServiceInstanceCondition) error {
 	mitigatingOrphan := instance.Status.OrphanMitigationInProgress
 	provisioning := instance.Status.CurrentOperation == v1beta1.ServiceInstanceOperationProvision && !mitigatingOrphan
 	deleting := instance.Status.CurrentOperation == v1beta1.ServiceInstanceOperationDeprovision || mitigatingOrphan
-
-	msg := "Stopping reconciliation retries because too much time has elapsed"
-	failedCond := newServiceInstanceFailedCondition(v1beta1.ConditionTrue, errorReconciliationRetryTimeoutReason, msg)
 
 	var err error
 	switch {
@@ -944,14 +1132,32 @@ func (c *controller) processServiceInstancePollingFailureRetryTimeout(instance *
 		c.finishPollingServiceInstance(instance)
 		return c.processTerminalProvisionFailure(instance, readyCond, failedCond, true)
 	default:
-		readyCond := newServiceInstanceReadyCondition(v1beta1.ConditionFalse, errorReconciliationRetryTimeoutReason, msg)
+		readyCond := newServiceInstanceReadyCondition(v1beta1.ConditionFalse, failedCond.Reason, failedCond.Message)
 		err = c.processTerminalUpdateServiceInstanceFailure(instance, readyCond, failedCond)
 	}
 	if err != nil {
+		c.recorder.Event(instance, corev1.EventTypeWarning, failedCond.Reason, failedCond.Message)
 		return c.handleServiceInstancePollingError(instance, err)
 	}
 
 	return c.finishPollingServiceInstance(instance)
+}
+
+// processServiceInstancePollingTerminalFailure marks the instance as having
+// failed polling with a temporary error
+func (c *controller) processServiceInstancePollingTemporaryFailure(instance *v1beta1.ServiceInstance, readyCond *v1beta1.ServiceInstanceCondition) error {
+	c.recorder.Event(instance, corev1.EventTypeWarning, readyCond.Reason, readyCond.Message)
+	setServiceInstanceCondition(instance, v1beta1.ServiceInstanceConditionReady, readyCond.Status, readyCond.Reason, readyCond.Message)
+
+	if _, err := c.updateServiceInstanceStatus(instance); err != nil {
+		return c.handleServiceInstancePollingError(instance, err)
+	}
+
+	// The instance will be requeued in any case, since we updated the status
+	// a few lines above.
+	// But we still need to return a non-nil error for retriable errors and
+	// orphan mitigation to avoid resetting the rate limiter.
+	return fmt.Errorf(readyCond.Message)
 }
 
 // resolveReferences checks to see if (Cluster)ServiceClassRef and/or (Cluster)ServicePlanRef are
@@ -977,7 +1183,7 @@ func (c *controller) resolveClusterReferences(instance *v1beta1.ServiceInstance)
 	var sc *v1beta1.ClusterServiceClass
 	var err error
 	if instance.Spec.ClusterServiceClassRef == nil {
-		instance, sc, err = c.resolveClusterServiceClassRef(instance)
+		sc, err = c.resolveClusterServiceClassRef(instance)
 		if err != nil {
 			return false, err
 		}
@@ -991,7 +1197,7 @@ func (c *controller) resolveClusterReferences(instance *v1beta1.ServiceInstance)
 			}
 		}
 
-		instance, err = c.resolveClusterServicePlanRef(instance, sc.Spec.ClusterServiceBrokerName)
+		err = c.resolveClusterServicePlanRef(instance, sc.Spec.ClusterServiceBrokerName)
 		if err != nil {
 			return false, err
 		}
@@ -1008,7 +1214,7 @@ func (c *controller) resolveNamespacedReferences(instance *v1beta1.ServiceInstan
 	var sc *v1beta1.ServiceClass
 	var err error
 	if instance.Spec.ServiceClassRef == nil {
-		instance, sc, err = c.resolveServiceClassRef(instance)
+		sc, err = c.resolveServiceClassRef(instance)
 		if err != nil {
 			return false, err
 		}
@@ -1022,7 +1228,7 @@ func (c *controller) resolveNamespacedReferences(instance *v1beta1.ServiceInstan
 			}
 		}
 
-		instance, err = c.resolveServicePlanRef(instance, sc.Spec.ServiceBrokerName)
+		err = c.resolveServicePlanRef(instance, sc.Spec.ServiceBrokerName)
 		if err != nil {
 			return false, err
 		}
@@ -1035,10 +1241,10 @@ func (c *controller) resolveNamespacedReferences(instance *v1beta1.ServiceInstan
 // and updates the instance.
 // If ClusterServiceClass can not be resolved, returns an error, records an
 // Event, and sets the InstanceCondition with the appropriate error message.
-func (c *controller) resolveClusterServiceClassRef(instance *v1beta1.ServiceInstance) (*v1beta1.ServiceInstance, *v1beta1.ClusterServiceClass, error) {
+func (c *controller) resolveClusterServiceClassRef(instance *v1beta1.ServiceInstance) (*v1beta1.ClusterServiceClass, error) {
 	if !instance.Spec.ClusterServiceClassSpecified() {
 		// ServiceInstance is in invalid state, should not ever happen. check
-		return nil, nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ClusterServiceClassExternalName, ClusterServiceClassExternalID, nor ClusterServiceClassName is set", instance.Namespace, instance.Name)
+		return nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ClusterServiceClassExternalName, ClusterServiceClassExternalID, nor ClusterServiceClassName is set", instance.Namespace, instance.Name)
 	}
 
 	pcb := pretty.NewInstanceContextBuilder(instance)
@@ -1071,7 +1277,7 @@ func (c *controller) resolveClusterServiceClassRef(instance *v1beta1.ServiceInst
 				"The instance references a ClusterServiceClass that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentClusterServiceClassReason, s)
-			return nil, nil, fmt.Errorf(s)
+			return nil, fmt.Errorf(s)
 		}
 	} else {
 		filterField := instance.Spec.GetClusterServiceClassFilterFieldName()
@@ -1105,21 +1311,21 @@ func (c *controller) resolveClusterServiceClassRef(instance *v1beta1.ServiceInst
 				"The instance references a ClusterServiceClass that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentClusterServiceClassReason, s)
-			return nil, nil, fmt.Errorf(s)
+			return nil, fmt.Errorf(s)
 		}
 	}
 
-	return instance, sc, nil
+	return sc, nil
 }
 
 // resolveServiceClassRef resolves a reference to a ServiceClass
 // and updates the instance.
 // If ServiceClass can not be resolved, returns an error, records an
 // Event, and sets the InstanceCondition with the appropriate error message.
-func (c *controller) resolveServiceClassRef(instance *v1beta1.ServiceInstance) (*v1beta1.ServiceInstance, *v1beta1.ServiceClass, error) {
+func (c *controller) resolveServiceClassRef(instance *v1beta1.ServiceInstance) (*v1beta1.ServiceClass, error) {
 	if !instance.Spec.ServiceClassSpecified() {
 		// ServiceInstance is in invalid state, should not ever happen. check
-		return nil, nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ServiceClassExternalName, ServiceClassExternalID, nor ServiceClassName is set", instance.Namespace, instance.Name)
+		return nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ServiceClassExternalName, ServiceClassExternalID, nor ServiceClassName is set", instance.Namespace, instance.Name)
 	}
 
 	pcb := pretty.NewContextBuilder(pretty.ServiceInstance, instance.Namespace, instance.Name, "")
@@ -1152,7 +1358,7 @@ func (c *controller) resolveServiceClassRef(instance *v1beta1.ServiceInstance) (
 				"The instance references a ServiceClass that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentServiceClassReason, s)
-			return nil, nil, fmt.Errorf(s)
+			return nil, fmt.Errorf(s)
 		}
 	} else {
 		filterField := instance.Spec.GetServiceClassFilterFieldName()
@@ -1186,21 +1392,21 @@ func (c *controller) resolveServiceClassRef(instance *v1beta1.ServiceInstance) (
 				"The instance references a ServiceClass that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentServiceClassReason, s)
-			return nil, nil, fmt.Errorf(s)
+			return nil, fmt.Errorf(s)
 		}
 	}
 
-	return instance, sc, nil
+	return sc, nil
 }
 
 // resolveClusterServicePlanRef resolves a reference  to a ClusterServicePlan
 // and updates the instance.
 // If ClusterServicePlan can not be resolved, returns an error, records an
 // Event, and sets the InstanceCondition with the appropriate error message.
-func (c *controller) resolveClusterServicePlanRef(instance *v1beta1.ServiceInstance, brokerName string) (*v1beta1.ServiceInstance, error) {
+func (c *controller) resolveClusterServicePlanRef(instance *v1beta1.ServiceInstance, brokerName string) error {
 	if !instance.Spec.ClusterServicePlanSpecified() {
 		// ServiceInstance is in invalid state, should not ever happen. check
-		return nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ClusterServicePlanExternalName, ClusterServicePlanExternalID, nor ClusterServicePlanName is set", instance.Namespace, instance.Name)
+		return fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ClusterServicePlanExternalName, ClusterServicePlanExternalID, nor ClusterServicePlanName is set", instance.Namespace, instance.Name)
 	}
 
 	pcb := pretty.NewInstanceContextBuilder(instance)
@@ -1229,7 +1435,7 @@ func (c *controller) resolveClusterServicePlanRef(instance *v1beta1.ServiceInsta
 				"The instance references a ClusterServicePlan that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentClusterServicePlanReason, s)
-			return nil, fmt.Errorf(s)
+			return fmt.Errorf(s)
 		}
 	} else {
 		fieldSet := fields.Set{
@@ -1262,21 +1468,21 @@ func (c *controller) resolveClusterServicePlanRef(instance *v1beta1.ServiceInsta
 				"The instance references a ClusterServicePlan that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentClusterServicePlanReason, s)
-			return nil, fmt.Errorf(s)
+			return fmt.Errorf(s)
 		}
 	}
 
-	return instance, nil
+	return nil
 }
 
 // resolveServicePlanRef resolves a reference  to a ServicePlan
 // and updates the instance.
 // If ServicePlan can not be resolved, returns an error, records an
 // Event, and sets the InstanceCondition with the appropriate error message.
-func (c *controller) resolveServicePlanRef(instance *v1beta1.ServiceInstance, brokerName string) (*v1beta1.ServiceInstance, error) {
+func (c *controller) resolveServicePlanRef(instance *v1beta1.ServiceInstance, brokerName string) error {
 	if !instance.Spec.ServicePlanSpecified() {
 		// ServiceInstance is in invalid state, should not ever happen. check
-		return nil, fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ServicePlanExternalName, ServicePlanExternalID, nor ServicePlanName is set", instance.Namespace, instance.Name)
+		return fmt.Errorf("ServiceInstance %s/%s is in invalid state, neither ServicePlanExternalName, ServicePlanExternalID, nor ServicePlanName is set", instance.Namespace, instance.Name)
 	}
 
 	pcb := pretty.NewContextBuilder(pretty.ServiceInstance, instance.Namespace, instance.Name, "")
@@ -1305,7 +1511,7 @@ func (c *controller) resolveServicePlanRef(instance *v1beta1.ServiceInstance, br
 				"The instance references a ServicePlan that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentServicePlanReason, s)
-			return nil, fmt.Errorf(s)
+			return fmt.Errorf(s)
 		}
 	} else {
 		fieldSet := fields.Set{
@@ -1338,11 +1544,75 @@ func (c *controller) resolveServicePlanRef(instance *v1beta1.ServiceInstance, br
 				"The instance references a ServicePlan that does not exist. "+s,
 			)
 			c.recorder.Event(instance, corev1.EventTypeWarning, errorNonexistentServicePlanReason, s)
-			return nil, fmt.Errorf(s)
+			return fmt.Errorf(s)
 		}
 	}
 
-	return instance, nil
+	return nil
+}
+
+// applyDefaultProvisioningParameters applies any default provisioning parameters for an instance.
+// If parameter defaults were applied, and the instance status was successfully updated, the method returns true
+// If either can not be resolved, returns an error and sets the InstanceCondition
+// with the appropriate error message.
+func (c *controller) applyDefaultProvisioningParameters(instance *v1beta1.ServiceInstance) (bool, error) {
+	// The default parameters are only applied once (though we may revisit that decision in the future depending on how
+	// we want to handle plan changes).
+	if instance.Status.DefaultProvisionParameters != nil {
+		return false, nil
+	}
+
+	defaultParams, err := c.getDefaultProvisioningParameters(instance)
+	if err != nil {
+		return false, err
+	}
+
+	finalParams, err := mergeParameters(instance.Spec.Parameters, defaultParams)
+	if err != nil {
+		return false, err
+	}
+
+	if instance.Spec.Parameters == finalParams {
+		return false, nil
+	}
+
+	pcb := pretty.NewContextBuilder(pretty.ServiceInstance, instance.Namespace, instance.Name, "")
+	glog.V(4).Info(pcb.Message("Applying default provisioning parameters"))
+
+	instance.Spec.Parameters = finalParams
+	_, err = c.updateServiceInstanceWithRetries(instance, func(conflictedInstance *v1beta1.ServiceInstance) {
+		conflictedInstance.Spec.Parameters = finalParams
+	})
+	if err != nil {
+		s := fmt.Sprintf("error updating service instance to apply default parameters: %s", err)
+		glog.Warning(pcb.Message(s))
+		c.recorder.Event(instance, corev1.EventTypeWarning, errorWithParameters, s)
+		return false, fmt.Errorf(s)
+	}
+
+	instance.Status.DefaultProvisionParameters = defaultParams
+	_, err = c.updateServiceInstanceStatus(instance)
+	return true, err
+}
+
+func (c *controller) getDefaultProvisioningParameters(instance *v1beta1.ServiceInstance) (*runtime.RawExtension, error) {
+	if instance.Spec.ClusterServicePlanSpecified() {
+		plan, err := c.clusterServicePlanLister.Get(instance.Spec.ClusterServicePlanRef.Name)
+		if err != nil {
+			return nil, err
+		}
+		return plan.Spec.DefaultProvisionParameters, nil
+	}
+
+	if instance.Spec.ServicePlanSpecified() {
+		plan, err := c.servicePlanLister.ServicePlans(instance.Namespace).Get(instance.Spec.ServicePlanRef.Name)
+		if err != nil {
+			return nil, err
+		}
+		return plan.Spec.DefaultProvisionParameters, nil
+	}
+
+	return nil, fmt.Errorf("invalid plan reference %v", instance.Spec.PlanReference)
 }
 
 func (c *controller) prepareProvisionRequest(instance *v1beta1.ServiceInstance) (*osb.ProvisionRequest, *v1beta1.ServiceInstancePropertiesState, error) {
@@ -1408,13 +1678,6 @@ func newServiceInstanceReadyCondition(status v1beta1.ConditionStatus, reason, me
 // time set to now.
 func newServiceInstanceFailedCondition(status v1beta1.ConditionStatus, reason, message string) *v1beta1.ServiceInstanceCondition {
 	return newServiceInstanceCondition(status, v1beta1.ServiceInstanceConditionFailed, reason, message)
-}
-
-// newServiceInstanceOrphanMitigationCondition is a helper function that returns
-// an OrphanMitigation condition with the given status, reason and message,
-// with its transition time set to now.
-func newServiceInstanceOrphanMitigationCondition(status v1beta1.ConditionStatus, reason, message string) *v1beta1.ServiceInstanceCondition {
-	return newServiceInstanceCondition(status, v1beta1.ServiceInstanceConditionOrphanMitigation, reason, message)
 }
 
 // removeServiceInstanceCondition removes a condition of a given type from an
@@ -1524,6 +1787,51 @@ func (c *controller) updateServiceInstanceReferences(toUpdate *v1beta1.ServiceIn
 	// The UpdateReferences method ignores status changes.
 	// Restore status that might have changed locally to be able to update it later.
 	updatedInstance.Status = status
+	return updatedInstance, err
+}
+
+// updateServiceInstanceWithRetries updates the instance
+// and automatically retries if a 409 Conflict error is
+// returned by the API server.
+// If a conflict occurs, the provided conflictResolutionFunc is called
+// so that the conflict can be resolved. There is no default universal safe
+// conflict resolution logic, so conflictResolutionFunc must always be provided.
+func (c *controller) updateServiceInstanceWithRetries(
+	instance *v1beta1.ServiceInstance,
+	conflictResolutionFunc func(*v1beta1.ServiceInstance)) (*v1beta1.ServiceInstance, error) {
+
+	pcb := pretty.NewInstanceContextBuilder(instance)
+
+	const interval = 100 * time.Millisecond
+	const timeout = 10 * time.Second
+	var updatedInstance *v1beta1.ServiceInstance
+
+	instanceToUpdate := instance
+	err := wait.PollImmediate(interval, timeout, func() (bool, error) {
+		glog.V(4).Info(pcb.Message("Updating instance"))
+		upd, err := c.serviceCatalogClient.ServiceInstances(instanceToUpdate.Namespace).Update(instanceToUpdate)
+		if err != nil {
+			if !errors.IsConflict(err) {
+				return false, err
+			}
+			glog.V(4).Info(pcb.Message("Couldn't update instance because the resource was stale"))
+			// Fetch a fresh instance to resolve the update conflict and retry
+			instanceToUpdate, err = c.serviceCatalogClient.ServiceInstances(instance.Namespace).Get(instance.Name, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			conflictResolutionFunc(instanceToUpdate)
+			return false, nil
+		}
+
+		updatedInstance = upd
+		return true, nil
+	})
+
+	if err != nil {
+		glog.Errorf(pcb.Messagef("Failed to update instance: %v", err))
+	}
+
 	return updatedInstance, err
 }
 
@@ -1900,12 +2208,18 @@ func (c *controller) innerPrepareProvisionRequest(instance *v1beta1.ServiceInsta
 	}
 
 	request := &osb.ProvisionRequest{
-		AcceptsIncomplete:   true,
-		InstanceID:          instance.Spec.ExternalID,
-		ServiceID:           classCommon.ExternalID,
-		PlanID:              planCommon.ExternalID,
-		Parameters:          rh.parameters,
-		OrganizationGUID:    c.getClusterID(),
+		AcceptsIncomplete: true,
+		InstanceID:        instance.Spec.ExternalID,
+		ServiceID:         classCommon.ExternalID,
+		PlanID:            planCommon.ExternalID,
+		Parameters:        rh.parameters,
+		// This field is DEPRECATED, but required to be sent by OSBAPI specification
+		// Consider using the context profile as defined in
+		// https://github.com/openservicebrokerapi/servicebroker/blob/v2.14/profile.md#kubernetes-context-object
+		OrganizationGUID: c.getClusterID(),
+		// This field is DEPRECATED, but required to be sent by OSBAPI specification
+		// Consider using the context profile as defined in
+		// https://github.com/openservicebrokerapi/servicebroker/blob/v2.14/profile.md#kubernetes-context-object
 		SpaceGUID:           string(rh.ns.UID),
 		Context:             rh.requestContext,
 		OriginatingIdentity: rh.originatingIdentity,
@@ -2062,7 +2376,7 @@ func (c *controller) prepareServiceInstanceLastOperationRequest(instance *v1beta
 	if instance.Status.InProgressProperties == nil {
 		pcb := pretty.NewInstanceContextBuilder(instance)
 		err := stderrors.New("Instance.Status.InProgressProperties can not be nil")
-		glog.Errorf(pcb.Message(err.Error()))
+		glog.Error(pcb.Message(err.Error()))
 		return nil, err
 	}
 
@@ -2141,6 +2455,7 @@ func (c *controller) processServiceInstanceGracefulDeletionSuccess(instance *v1b
 	pcb := pretty.NewInstanceContextBuilder(instance)
 	glog.Info(pcb.Message("Cleared finalizer"))
 
+	c.removeInstanceFromRetryMap(instance)
 	return nil
 }
 
@@ -2195,6 +2510,7 @@ func (c *controller) processProvisionSuccess(instance *v1beta1.ServiceInstance, 
 		return err
 	}
 
+	c.removeInstanceFromRetryMap(instance)
 	c.recorder.Eventf(instance, corev1.EventTypeNormal, successProvisionReason, successProvisionMessage)
 	return nil
 }
@@ -2205,6 +2521,7 @@ func (c *controller) processTerminalProvisionFailure(instance *v1beta1.ServiceIn
 	if failedCond == nil {
 		return fmt.Errorf("failedCond must not be nil")
 	}
+	c.removeInstanceFromRetryMap(instance)
 	return c.processProvisionFailure(instance, readyCond, failedCond, shouldMitigateOrphan)
 }
 
@@ -2301,6 +2618,7 @@ func (c *controller) processUpdateServiceInstanceSuccess(instance *v1beta1.Servi
 		return err
 	}
 
+	c.removeInstanceFromRetryMap(instance)
 	c.recorder.Eventf(instance, corev1.EventTypeNormal, successUpdateInstanceReason, successUpdateInstanceMessage)
 	return nil
 }
@@ -2311,6 +2629,7 @@ func (c *controller) processTerminalUpdateServiceInstanceFailure(instance *v1bet
 	if failedCond == nil {
 		return fmt.Errorf("failedCond must not be nil")
 	}
+	c.removeInstanceFromRetryMap(instance)
 	return c.processUpdateServiceInstanceFailure(instance, readyCond, failedCond)
 }
 

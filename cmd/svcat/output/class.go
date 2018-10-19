@@ -20,68 +20,107 @@ import (
 	"io"
 	"strings"
 
-	"github.com/kubernetes-incubator/service-catalog/pkg/apis/servicecatalog/v1beta1"
+	"github.com/kubernetes-incubator/service-catalog/pkg/svcat/service-catalog"
 )
 
-func getClassStatusText(status v1beta1.ClusterServiceClassStatus) string {
-	if status.RemovedFromBrokerCatalog {
-		return statusDeprecated
+func getScope(class servicecatalog.Class) string {
+	if class.GetNamespace() != "" {
+		return servicecatalog.NamespaceScope
 	}
-	return statusActive
+	return servicecatalog.ClusterScope
 }
 
-func writeClassListTable(w io.Writer, classes []v1beta1.ClusterServiceClass) {
+func writeClassListTable(w io.Writer, classes []servicecatalog.Class) {
 	t := NewListTable(w)
+
 	t.SetHeader([]string{
 		"Name",
+		"Namespace",
 		"Description",
 	})
+	t.SetVariableColumn(3)
+
 	for _, class := range classes {
 		t.Append([]string{
-			class.Spec.ExternalName,
-			class.Spec.Description,
+			class.GetExternalName(),
+			class.GetNamespace(),
+			class.GetDescription(),
 		})
 	}
+
 	t.Render()
 }
 
 // WriteClassList prints a list of classes in the specified output format.
-func WriteClassList(w io.Writer, outputFormat string, classes ...v1beta1.ClusterServiceClass) {
-	classList := v1beta1.ClusterServiceClassList{
-		Items: classes,
-	}
+func WriteClassList(w io.Writer, outputFormat string, classes ...servicecatalog.Class) {
 	switch outputFormat {
-	case formatJSON:
-		writeJSON(w, classList)
-	case formatYAML:
-		writeYAML(w, classList, 0)
-	case formatTable:
+	case FormatJSON:
+		writeJSON(w, classes)
+	case FormatYAML:
+		writeYAML(w, classes, 0)
+	case FormatTable:
 		writeClassListTable(w, classes)
 	}
 }
 
 // WriteClass prints a single class in the specified output format.
-func WriteClass(w io.Writer, outputFormat string, class v1beta1.ClusterServiceClass) {
+func WriteClass(w io.Writer, outputFormat string, class servicecatalog.Class) {
 	switch outputFormat {
-	case formatJSON:
+	case FormatJSON:
 		writeJSON(w, class)
-	case formatYAML:
+	case FormatYAML:
 		writeYAML(w, class, 0)
-	case formatTable:
-		writeClassListTable(w, []v1beta1.ClusterServiceClass{class})
+	case FormatTable:
+		writeClassListTable(w, []servicecatalog.Class{class})
 	}
 }
 
 // WriteClassDetails prints details for a single class.
-func WriteClassDetails(w io.Writer, class *v1beta1.ClusterServiceClass) {
+func WriteClassDetails(w io.Writer, class servicecatalog.Class) {
+	scope := getScope(class)
+	spec := class.GetSpec()
 	t := NewDetailsTable(w)
+	t.Append([]string{"Name:", spec.ExternalName})
+	if class.GetNamespace() != "" {
+		t.Append([]string{"Namespace:", class.GetNamespace()})
+	}
 	t.AppendBulk([][]string{
-		{"Name:", class.Spec.ExternalName},
-		{"Description:", class.Spec.Description},
-		{"UUID:", string(class.Name)},
-		{"Status:", getClassStatusText(class.Status)},
-		{"Tags:", strings.Join(class.Spec.Tags, ", ")},
-		{"Broker:", class.Spec.ClusterServiceBrokerName},
+		{"Scope:", scope},
+		{"Description:", spec.Description},
+		{"UUID:", class.GetName()},
+		{"Status:", class.GetStatusText()},
+		{"Tags:", strings.Join(spec.Tags, ", ")},
+		{"Broker:", class.GetServiceBrokerName()},
 	})
+	t.Render()
+}
+
+// WriteClassAndPlanDetails prints details for multiple classes and plans
+func WriteClassAndPlanDetails(w io.Writer, classes []servicecatalog.Class, plans [][]servicecatalog.Plan) {
+	t := NewListTable(w)
+	t.SetHeader([]string{
+		"Class",
+		"Plans",
+		"Description",
+	})
+	for i, class := range classes {
+		for i, plan := range plans[i] {
+			if i == 0 {
+				t.Append([]string{
+					class.GetExternalName(),
+					plan.GetName(),
+					class.GetSpec().Description,
+				})
+			} else {
+				t.Append([]string{
+					"",
+					plan.GetName(),
+					"",
+				})
+			}
+		}
+	}
+	t.table.SetAutoWrapText(true)
+	t.SetVariableColumn(3)
 	t.Render()
 }

@@ -44,7 +44,7 @@ import (
 	"github.com/kubernetes-incubator/service-catalog/pkg/client/clientset_generated/internalclientset"
 	informers "github.com/kubernetes-incubator/service-catalog/pkg/client/informers_generated/internalversion"
 	"github.com/kubernetes-incubator/service-catalog/pkg/openapi"
-	"github.com/kubernetes-incubator/service-catalog/pkg/svcat/kube"
+	"github.com/kubernetes-incubator/service-catalog/pkg/util/kube"
 	"github.com/kubernetes-incubator/service-catalog/pkg/version"
 )
 
@@ -74,7 +74,7 @@ func buildGenericConfig(s *ServiceCatalogServerOptions) (*genericapiserver.Recom
 	if err := s.GenericServerRunOptions.ApplyTo(&genericConfig.Config); err != nil {
 		return nil, nil, err
 	}
-	if err := s.SecureServingOptions.ApplyTo(&genericConfig.Config); err != nil {
+	if err := s.SecureServingOptions.ApplyTo(&genericConfig.Config.SecureServing, &genericConfig.Config.LoopbackClientConfig); err != nil {
 		return nil, nil, err
 	}
 	if !s.DisableAuth && !s.StandaloneMode {
